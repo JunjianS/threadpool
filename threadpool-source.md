@@ -74,10 +74,10 @@ commonExecutor.execute(new Thread() {
 private boolean addWorker(Runnable firstTask, boolean core) {
 // java标签
 retry:
-            // 死循环
+    // 死循环
     for (;;) {
         int c = ctl.get();
-        // 获取当前线程状态
+        // 获取当前线程池状态
         int rs = runStateOf(c);
         // Check if queue empty only if necessary.
         // 这个逻辑判断有点绕可以改成
@@ -162,5 +162,123 @@ retry:
             addWorkerFailed(w);
     }
     return workerStarted;
+}
+```
+
+addWorker之后是runWorker,第一次启动会执行初始化传进来的任务firstTask；然后会从workQueue中取任务执行，如果队列为空则等待keepAliveTime这么长时间
+
+```
+final void runWorker(Worker w) {
+    Thread wt = Thread.currentThread();
+    Runnable task = w.firstTask;
+    w.firstTask = null;
+    // 允许中断
+    w.unlock();        
+    boolean completedAbruptly = true;
+    try {
+        // 如果getTask返回null那么getTask中会将workerCount递减，如果异常了这个递减操作会在processWorkerExit中处理
+        while (task != null || (task = getTask()) != null) {
+            w.lock();
+            // If pool is stopping, ensure thread is interrupted;
+            // if not, ensure thread is not interrupted.  This
+            // requires a recheck in second case to deal with
+            // shutdownNow race while clearing interrupt
+            if ((runStateAtLeast(ctl.get(), STOP) ||
+                    (Thread.interrupted() &&
+                     runStateAtLeast(ctl.get(), STOP))) &&
+                    !wt.isInterrupted())
+                wt.interrupt();
+            try {
+                beforeExecute(wt, task);
+                Throwable thrown = null;
+                try {
+                    task.run();
+                } catch (RuntimeException x) {
+                    thrown = x;
+                    throw x;
+                } catch (Error x) {
+                    thrown = x;
+                    throw x;
+                } catch (Throwable x) {
+                    thrown = x;
+                    throw new Error(x);
+                }
+                finally {
+                    afterExecute(task, thrown);
+                }
+            }
+            finally {
+                task = null;
+                w.completedTasks++;
+                w.unlock();
+            }
+        }
+        completedAbruptly = false;
+    }
+    finally {
+        processWorkerExit(w, completedAbruptly);
+    }
+}
+```
+
+我们看下getTask是如何执行的
+
+```
+private Runnable getTask() {
+    boolean timedOut = false;         
+// 死循环
+retry:
+    for (;;) {
+        // 获取线程池状态
+        int c = ctl.get();
+        int rs = runStateOf(c);
+        // Check if queue empty only if necessary.
+        // 1.rs > SHUTDOWN 所以rs至少等于STOP,这时不再处理队列中的任务
+        // 2.rs = SHUTDOWN 所以rs>=STOP肯定不成立，这时还需要处理队列中的任务除非队列为空
+        // 这两种情况都会返回null让runWoker退出while循环也就是当前线程结束了，所以必须要decrement
+        if (rs >= SHUTDOWN && (rs >= STOP || workQueue.isEmpty())) {
+            // 递减workerCount值
+            decrementWorkerCount();
+            return null;
+        }
+        // 标记从队列中取任务时是否设置超时时间
+        boolean timed;         
+        // 1.RUNING状态
+        // 2.SHUTDOWN状态，但队列中还有任务需要执行
+        for (;;) {
+            int wc = workerCountOf(c);
+            // 1.core thread允许被超时，那么超过corePoolSize的的线程必定有超时
+            // 2.allowCoreThreadTimeOut == false && wc >
+            // corePoolSize时，一般都是这种情况，core thread即使空闲也不会被回收，只要超过的线程才会
+            timed = allowCoreThreadTimeOut || wc > corePoolSize;
+            // 从addWorker可以看到一般wc不会大于maximumPoolSize，所以更关心后面半句的情形：
+            // 1. timedOut == false 第一次执行循环， 从队列中取出任务不为null方法返回 或者
+            // poll出异常了重试
+            // 2.timeOut == true && timed ==
+            // false:看后面的代码workerQueue.poll超时时timeOut才为true，
+            // 并且timed要为false，这两个条件相悖不可能同时成立（既然有超时那么timed肯定为true）
+            // 所以超时不会继续执行而是return null结束线程。
+            if (wc <= maximumPoolSize && !(timedOut && timed))
+                break;
+            // workerCount递减，结束当前thread
+            if (compareAndDecrementWorkerCount(c))
+                return null;
+            c = ctl.get();         
+            // 需要重新检查线程池状态，因为上述操作过程中线程池可能被SHUTDOWN
+            if (runStateOf(c) != rs)
+                continue retry;
+            // else CAS failed due to workerCount change; retry inner loop
+        }
+        try {
+            // 1.以指定的超时时间从队列中取任务
+            // 2.core thread没有超时
+            Runnable r = timed ? workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) : workQueue.take();
+            if (r != null)
+                return r;
+            timedOut = true;        // 超时
+        } catch (InterruptedException retry) {
+            timedOut = false;       // 线程被中断重试
+        }
+    }
 }
 ```
